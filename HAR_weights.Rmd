@@ -1,0 +1,149 @@
+---
+title: "(HAR) Dataset - Correct Weightlifting Identification"
+output:
+  html_document:
+    code_folding: show
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(caret); require(tidyverse); require(randomForest)
+require(MASS); require(kernlab); require(knitr); require(kableExtra)
+set.seed(12321) #setting seed for reproducibility
+```
+
+##Executive Summary  
+The Human Activity Research (HAR) dataset provides a set of measurements from activity monitors for six participants in a trial to assess a correct dumbbell lifting method against four incorrect methods. Each subject wore three monitors - on the upper arm, forearm and on a belt along with a monitor on the dumbbell itself. Accelerometer readings are recorded for each monitor for each lift along with a classification code for the lift type - "A" for correct and "B", "C", "D" and "E" for the four incorrect methods. In total 152 variables were recorded, 38 for each monitor.  
+
+The purpose of the trial was to assess not only "what" exercise is being performed but "how well" it is being performed. A random forest developed was able to identify the correct lift type with $99.4\% \pm 0.2\%$ out-of-sample accuracy. Both linear discriminate analysis and support vector machine models showed a significant level of accuracy at $71\%$ and $75\%$ respectively, though far below the random forest model. Neither ensembling through majority voting or stacking through a random forest model trained on the predictions showed an improvement over the primary random forest model. 
+
+
+---
+
+##Exploratory Analysis  
+For the purposes of this analysis, 19644 observations are available. We will firstly separate a model training set with 60% of the data and set aside 20% for ensemble training and 20% for testing.  
+```{r get & seperate data, cache=TRUE}
+training_URL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+fullSet <- read.csv(training_URL)
+#seperate full train into train, ensemble selection & testing sets
+inTrain <- createDataPartition(fullSet$classe, p = 0.6, list = FALSE)
+training <- fullSet[inTrain,]; temp <- fullSet[-inTrain,]
+#seperating ensemble test & final test sets
+inEnsemble <- createDataPartition(temp$classe, p = 0.5, list = FALSE)
+ensemble <- temp[inEnsemble,]; testing <- temp[-inEnsemble,]
+```
+An analysis of the variable names show the first seven are used for administrative / identification purposes and the final variable is our outcome - "classe". We can check for the prevalence of missing data.  
+```{r missing data}
+nasums <- apply(training, 2, function(x) sum(is.na(x))) # sum of col na values
+blanksums <- apply(training, 2, function(x) sum(x == "", na.rm = TRUE))# sum of cols blank values
+missing <- nasums + blanksums
+kable(table(missing), caption = "Missing/NA Values") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "float_left")
+```
+For 52 of our variables, and the eight classifiers, there are no missing values, while for 100 exactly 11529 of the 11776 observations, or `r round((11529/nrow(training))*100, 2)`%, are missing. As these variables appear to have been systematically not recorded for the majority of the observations we will exclude these variables and use the remaining 52 to form the basis of our predictors.  
+```{r remove missing}
+#remove columns of missing data
+naVars <- names(missing[missing == 11529])
+truncTraining <- dplyr::select(training, -naVars, -c(1:7))
+```
+
+---
+
+##Model Selection
+Examining these remaining variables we see four sets of variables recorded, i.e. for each sensor we now have an observation for "roll", "pitch", "yaw", "total_accel", and x, y and z components for "gyros", "accel" and "magnet". On the basis of these available variables we can develop multi-class classification algorithms on the training set and assess their out-of-sample accuracy on the ensemble set. We can further ensemble the models, using majority voting, and assess these.  
+
+We will initially train Random Forest (RF), Linear Discriminate Analysis (LDA) and Support Vector Machine (SVM) models on the selected features in the training set.
+```{r model training and prediction, message=FALSE, warning=FALSE}
+#train models & get error estimates
+RFmdl <- randomForest(classe ~., data = truncTraining)
+RFerr <- 1 - mean(RFmdl$predicted == truncTraining$classe)
+LDAmdl <- lda(classe ~., data = truncTraining)
+LDAerr <- 1 - mean(predict(LDAmdl, truncTraining)$class == truncTraining$classe)
+SVMmdl <- lssvm(classe ~., data = truncTraining)
+SVMerr <- 1 - mean(predict(SVMmdl, truncTraining) == truncTraining$classe)
+#Predict on ensemble set
+RFpredEN <- predict(RFmdl, ensemble)
+LDApredEN <- predict(LDAmdl, ensemble)
+SVMpredEN <- predict(SVMmdl, ensemble)
+#get NIR rate
+enNIR <- table(ensemble$classe)[which.max(table(ensemble$classe))][[1]]/length(ensemble$classe)
+#combine predictions into dataframe
+predEN <- data.frame(RF = RFpredEN, LDA = LDApredEN$class, SVM = SVMpredEN)
+#set up data frame of metrics for table
+metrics <- data.frame(matrix(rep(NA, 12), ncol = 3, nrow = 4),
+                      row.names = c("Model Est. Error", "Accuracy", "Accuracy 95% CI",
+                                    paste0("p-value - Acc v NIR(", round(enNIR, 3), ")")))
+names(metrics) <- c("RF", "LDA", "SVM")
+metrics[1,] <- paste0(round(c(RFerr, LDAerr, SVMerr)*100, 2), "%")
+for (i in 1:3) {
+    temp <- confusionMatrix(predEN[,i], ensemble$classe)
+    metrics[2,i] <- round(temp$overall[[1]], 3)
+    metrics[3,i] <- paste0(round(temp$overall[[3]], 3), " - ", round(temp$overall[[4]], 3))
+    metrics[4,i] <- ifelse(temp$overall[[6]] == 0, "< 2.2e-16", temp$overall[[6]])
+}
+kable(metrics, caption = "Model Metrics - Predictions on Ensemble Set") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+The Random Forest is the most accurate of our selected models with an estimated error rate of 0.69% and a similar out-of-sample error rate at 0.7%. For both the LDA and SVM models show considerably less accuracy with a noticeable increase in error rate out-of-sample ca. 0.006. 
+  
+---  
+  
+##Ensembling Models
+We will examine the accuracy of a combined model by majority voting on the ensemble set, using the RF model as a tie-breaker as the most accurate model.
+```{r majority vote}
+majVote <- as.factor(sapply(
+    apply(predEN, 1, function(x) ifelse(unique(x) == 3, x[1], names(which.max(table(x))))),
+    function(x) x[[1]]))
+confusionMatrix(majVote, ensemble$classe)
+```
+The combination by majority vote is an improvement on the LDA & SVM models, while remaining considerably less than the RF model. We can stack the models by training a Random Forest model on the ensemble set predictions and do a final examination on the testing set.
+```{r stacked model}
+#stack models & get est. error
+ENmdl <- randomForest(classe ~., data = cbind(predEN, classe = ensemble$classe))
+ENerr <- 1 - mean(ENmdl$predicted == ensemble$classe)
+#trial stacked model on test set
+testPred <- data.frame(RF = predict(RFmdl, testing), LDA = predict(LDAmdl, testing)$class,
+                       SVM = predict(SVMmdl, testing))
+testENPred <- predict(ENmdl, testPred)
+#combine predictions into dataframe
+testPred <- cbind(testPred, Stacked = testENPred)
+testNIR <- table(testing$classe)[which.max(table(testing$classe))][[1]]/length(testing$classe)
+#set up data frame of metrics for table
+metrics <- data.frame(matrix(rep(NA, 16), ncol = 4, nrow = 4),
+                      row.names = c("Model Est. Error", "Accuracy", "Accuracy 95% CI",
+                                    paste0("p-value - Acc v NIR(", round(testNIR, 3), ")")))
+names(metrics) <- c("RF", "LDA", "SVM", "Stacked")
+metrics[1,] <- paste0(round(c(RFerr, LDAerr, SVMerr, ENerr)*100, 2), "%")
+for (i in 1:4) {
+    temp <- confusionMatrix(testPred[,i], testing$classe)
+    metrics[2,i] <- round(temp$overall[[1]], 3)
+    metrics[3,i] <- paste0(round(temp$overall[[3]], 3), " - ", round(temp$overall[[4]], 3))
+    metrics[4,i] <- ifelse(temp$overall[[6]] == 0, "< 2.2e-16", temp$overall[[6]])
+}
+kable(metrics, caption = "Model Metrics - Predictions on Testing Set") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) 
+
+```
+
+The resulting stacked model compares well to the LDA & SVM models but is marginally poorer than the original random Forest model trained directly on the data, showing greater estimated error and out-of-sample error.
+
+--- 
+
+##Summary
+We will select this Random Forest model trained on the original data as our final model due the high degree of accuracy. This model shows a high degree of both sensitivity and specificity across all classes, as shown below.
+```{r RF metrics by class}
+k1 <- kable(confusionMatrix(testPred$RF, testing$classe)[[2]],
+            caption = "Confusion Matrix") %>% 
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,
+                    position = "float_left")
+k2 <- kable(round(t(confusionMatrix(testPred$RF, testing$classe)[[4]]), 3),
+            caption = "Model Metrics by Class") %>% 
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,
+                    position = "right")
+k1;k2
+```
+
+---
+
+> The data for this project come from: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har.  
